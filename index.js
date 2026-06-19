@@ -45,11 +45,15 @@ if (missingEnv.length) {
 
 const transporter = nodemailer.createTransport({
   host: "smtp.gmail.com",
-  port: 465,
-  secure: true,
+  port: 587,
+  secure: false, // STARTTLS on 587 — Railway allows this; 465 can hang.
   // Force IPv4: some container networks have no IPv6 route, which makes
   // Gmail's AAAA records resolve to an unreachable address (ENETUNREACH).
   family: 4,
+  // Fail fast instead of hanging if the host blocks outbound SMTP.
+  connectionTimeout: 10000,
+  greetingTimeout: 10000,
+  socketTimeout: 15000,
   auth: {
     user: process.env.EMAIL,
     pass: process.env.EMAIL_APP_PASSWORD,
