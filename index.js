@@ -31,8 +31,25 @@ function logError(...args) {
   console.error(`[${timestamp()}]`, ...args);
 }
 
+// Warn early if email config is missing so it's obvious in the logs,
+// rather than failing deep inside nodemailer on the first restock.
+const missingEnv = ["EMAIL", "EMAIL_APP_PASSWORD", "NOTIFY_EMAIL"].filter(
+  (k) => !process.env[k]
+);
+if (missingEnv.length) {
+  logError(
+    `Missing env vars: ${missingEnv.join(", ")} — ` +
+      `monitoring will run but emails cannot be sent.`
+  );
+}
+
 const transporter = nodemailer.createTransport({
-  service: "gmail",
+  host: "smtp.gmail.com",
+  port: 465,
+  secure: true,
+  // Force IPv4: some container networks have no IPv6 route, which makes
+  // Gmail's AAAA records resolve to an unreachable address (ENETUNREACH).
+  family: 4,
   auth: {
     user: process.env.EMAIL,
     pass: process.env.EMAIL_APP_PASSWORD,
