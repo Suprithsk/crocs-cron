@@ -1,6 +1,5 @@
 const axios = require("axios");
 const cron = require("node-cron");
-const nodemailer = require("nodemailer");
 require("dotenv").config();
 // url_key of the product to watch, read off the product page URL on crocs.in
 // e.g. https://www.crocs.in/<url-key>.html
@@ -31,9 +30,14 @@ function logError(...args) {
   console.error(`[${timestamp()}]`, ...args);
 }
 
-// Warn early if email config is missing so it's obvious in the logs,
-// rather than failing deep inside nodemailer on the first restock.
-const missingEnv = ["EMAIL", "EMAIL_APP_PASSWORD", "NOTIFY_EMAIL"].filter(
+// Email is sent via Resend's HTTP API (https:443), since Railway blocks
+// outbound SMTP ports. RESEND_API_KEY is required; FROM_EMAIL defaults to
+// Resend's shared sender, which can only deliver to your own verified address.
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const FROM_EMAIL = process.env.FROM_EMAIL || "onboarding@resend.dev";
+
+// Warn early if email config is missing so it's obvious in the logs.
+const missingEnv = ["RESEND_API_KEY", "NOTIFY_EMAIL"].filter(
   (k) => !process.env[k]
 );
 if (missingEnv.length) {
@@ -43,36 +47,29 @@ if (missingEnv.length) {
   );
 }
 
-const transporter = nodemailer.createTransport({
-  host: "smtp.gmail.com",
-  port: 587,
-  secure: false, // STARTTLS on 587 — Railway allows this; 465 can hang.
-  // Force IPv4: some container networks have no IPv6 route, which makes
-  // Gmail's AAAA records resolve to an unreachable address (ENETUNREACH).
-  family: 4,
-  // Fail fast instead of hanging if the host blocks outbound SMTP.
-  connectionTimeout: 10000,
-  greetingTimeout: 10000,
-  socketTimeout: 15000,
-  auth: {
-    user: process.env.EMAIL,
-    pass: process.env.EMAIL_APP_PASSWORD,
-  },
-});
-
 async function sendEmail(productName, sku) {
-  await transporter.sendMail({
-    from: process.env.EMAIL,
-    to: process.env.NOTIFY_EMAIL,
-    subject: `🚨 Crocs ${TARGET_SIZE} Back In Stock`,
-    html: `
+  await axios.post(
+    "https://api.resend.com/emails",
+    {
+      from: FROM_EMAIL,
+      to: process.env.NOTIFY_EMAIL,
+      subject: `🚨 Crocs ${TARGET_SIZE} Back In Stock`,
+      html: `
       <h2>${productName || "Crocs"} (size ${TARGET_SIZE}) is available</h2>
       <p>Variant <strong>${sku}</strong> is now in stock.</p>
       <a href="${PRODUCT_URL}">
         Buy Now
       </a>
     `,
-  });
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${RESEND_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      timeout: 15000,
+    }
+  );
 
   log("Email sent");
 }
