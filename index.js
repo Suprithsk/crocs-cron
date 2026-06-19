@@ -124,7 +124,7 @@ async function checkStock() {
   }
 }
 
-cron.schedule("* * * * *", async () => {
+cron.schedule("*/5 * * * *", async () => {
   log("Checking stock...");
   await checkStock();
 });
