@@ -75,28 +75,55 @@ const RECIPIENTS = (process.env.NOTIFY_EMAIL || "")
   .map((e) => e.trim())
   .filter(Boolean);
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 async function sendMail(subject, html) {
-  await axios.post(
-    "https://api.resend.com/emails",
-    { from: FROM_EMAIL, to: RECIPIENTS, subject, html },
-    {
-      headers: {
-        Authorization: `Bearer ${RESEND_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      timeout: 15000,
+  // Resend's free tier allows 2 req/s; retry once on 429 after a short wait.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await axios.post(
+        "https://api.resend.com/emails",
+        { from: FROM_EMAIL, to: RECIPIENTS, subject, html },
+        {
+          headers: {
+            Authorization: `Bearer ${RESEND_API_KEY}`,
+            "Content-Type": "application/json",
+          },
+          timeout: 15000,
+        }
+      );
+      return;
+    } catch (err) {
+      if (err.response?.status === 429 && attempt === 0) {
+        await sleep(1100);
+        continue;
+      }
+      throw err;
     }
-  );
+  }
 }
 
-async function sendAvailabilityEmail(title, url) {
+// One email for all variants that newly became available this cycle, so a
+// multi-variant restock is a single Resend call (avoids the 2 req/s rate
+// limit) and one tidy email instead of one per colour.
+async function sendAvailabilityEmail(variants) {
+  const items = variants
+    .map(
+      (v) =>
+        `<li><a href="${v.url || PRODUCT_URL}">${v.title}</a></li>`
+    )
+    .join("");
+  const heading =
+    variants.length === 1
+      ? `${variants[0].title} is now available`
+      : `${variants.length} iPhone 17 variants are now available`;
   await sendMail(
-    `🚨 ${title} is available on Flipkart`,
-    `<h2>${title} is now available</h2>
+    `🚨 ${heading} on Flipkart`,
+    `<h2>${heading}</h2>
      <p>Grab it before it sells out.</p>
-     <a href="${url || PRODUCT_URL}">Buy Now on Flipkart</a>`
+     <ul>${items}</ul>`
   );
-  log(`Availability email sent for: ${title}`);
+  log(`Availability email sent for: ${variants.map((v) => v.title).join(", ")}`);
 }
 
 async function sendPriceEmail(title, oldPrice, newPrice) {
@@ -197,9 +224,11 @@ async function checkStock() {
       return;
     }
 
+    // Collect variants that newly became available, then send ONE email.
+    const newlyAvailable = [];
     for (const v of watched) {
       if (v.available && !notified.has(v.title)) {
-        await sendAvailabilityEmail(v.title, v.url);
+        newlyAvailable.push(v);
         notified.add(v.title);
         log(`AVAILABLE: ${v.title}`);
       } else if (v.available) {
@@ -208,6 +237,11 @@ async function checkStock() {
         notified.delete(v.title); // re-arm if it goes unavailable again
         log(`${v.title} — not available`);
       }
+    }
+    let sentAvailability = false;
+    if (newlyAvailable.length) {
+      await sendAvailabilityEmail(newlyAvailable);
+      sentAvailability = true;
     }
 
     // Price change for the selected variant (the one the URL points to).
@@ -218,6 +252,9 @@ async function checkStock() {
       lastPrice = price;
       log(`Recorded starting price: ₹${price.toLocaleString("en-IN")}`);
     } else if (Math.abs(price - lastPrice) > PRICE_THRESHOLD) {
+      // Space the price email from the availability email so the two sends
+      // never hit Resend's per-second rate limit.
+      if (sentAvailability) await sleep(2000);
       const selectedTitle =
         response.data?.RESPONSE?.pageData?.pageContext?.titles?.title ||
         "iPhone 17";
