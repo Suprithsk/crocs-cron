@@ -10,12 +10,15 @@ require("dotenv").config();
 const REQUEST_BODY = {
   pageUri:
     process.env.FK_PAGE_URI ||
-    "/apple-iphone-17-mist-blue-256-gb/p/itm1834df7ee2812?pid=MOBHFN6YWTXZD8SG&marketplace=FLIPKART&lid=LSTMOBHFN6YWTXZD8SGROTZTS&q=iphone+17&fm=Search",
+    "/apple-iphone-17-lavender-256-gb/p/itmf37c8dffa4165?pid=MOBHFN6YKGBPYJZD&marketplace=FLIPKART&lid=LSTMOBHFN6YKGBPYJZDEZPBYP&q=iphone+17&fm=search-autosuggest",
   pageContext: {
     trackingContext: { context: { eVar61: "direct_product" } },
     networkSpeed: 6500,
   },
 };
+
+// Ignore price wobbles at or below this many rupees to avoid noise.
+const PRICE_THRESHOLD = Number(process.env.FK_PRICE_THRESHOLD || 100);
 
 // Product URL for the "Buy Now" link in the alert email.
 const PRODUCT_URL = `https://www.flipkart.com${REQUEST_BODY.pageUri}`;
@@ -34,6 +37,11 @@ const ROME_ENDPOINT =
 // Per-variant de-dupe: remember which variant titles we've already alerted on
 // so we email once per restock, not every cycle. Re-armed if it goes away.
 const notified = new Set();
+
+// In-memory last-seen price for the selected variant (the one the URL points
+// to — Flipkart only prices that variant in the response). Resets on restart,
+// so the first check after a restart just records the price without alerting.
+let lastPrice = null;
 
 // Timestamped logging (IST).
 function timestamp() {
@@ -60,19 +68,17 @@ if (missingEnv.length) {
   );
 }
 
-async function sendEmail(title, url) {
+// NOTIFY_EMAIL may be a comma-separated list; Resend accepts an array of
+// recipients in a single send.
+const RECIPIENTS = (process.env.NOTIFY_EMAIL || "")
+  .split(",")
+  .map((e) => e.trim())
+  .filter(Boolean);
+
+async function sendMail(subject, html) {
   await axios.post(
     "https://api.resend.com/emails",
-    {
-      from: FROM_EMAIL,
-      to: process.env.NOTIFY_EMAIL,
-      subject: `🚨 ${title} is available on Flipkart`,
-      html: `
-      <h2>${title} is now available</h2>
-      <p>Grab it before it sells out.</p>
-      <a href="${url || PRODUCT_URL}">Buy Now on Flipkart</a>
-    `,
-    },
+    { from: FROM_EMAIL, to: RECIPIENTS, subject, html },
     {
       headers: {
         Authorization: `Bearer ${RESEND_API_KEY}`,
@@ -81,7 +87,43 @@ async function sendEmail(title, url) {
       timeout: 15000,
     }
   );
-  log(`Email sent for: ${title}`);
+}
+
+async function sendAvailabilityEmail(title, url) {
+  await sendMail(
+    `🚨 ${title} is available on Flipkart`,
+    `<h2>${title} is now available</h2>
+     <p>Grab it before it sells out.</p>
+     <a href="${url || PRODUCT_URL}">Buy Now on Flipkart</a>`
+  );
+  log(`Availability email sent for: ${title}`);
+}
+
+async function sendPriceEmail(title, oldPrice, newPrice) {
+  const dir = newPrice > oldPrice ? "increased ⬆️" : "dropped ⬇️";
+  await sendMail(
+    `💰 ${title} price ${dir} to ₹${newPrice.toLocaleString("en-IN")}`,
+    `<h2>${title}</h2>
+     <p>Price ${dir} from <strong>₹${oldPrice.toLocaleString(
+      "en-IN"
+    )}</strong> to <strong>₹${newPrice.toLocaleString("en-IN")}</strong>.</p>
+     <a href="${PRODUCT_URL}">View on Flipkart</a>`
+  );
+  log(`Price email sent for: ${title} (₹${oldPrice} → ₹${newPrice})`);
+}
+
+// Find the selected variant's price block ({finalPrice, mrp} as numbers).
+function findSelectedPrice(obj) {
+  let price = null;
+  (function walk(o) {
+    if (!o || typeof o !== "object" || price != null) return;
+    if (typeof o.finalPrice === "number" && typeof o.mrp === "number") {
+      price = o.finalPrice;
+      return;
+    }
+    for (const k in o) walk(o[k]);
+  })(obj);
+  return price;
 }
 
 // Locate the { FSN: {available, ...} } products map anywhere in the response.
@@ -157,7 +199,7 @@ async function checkStock() {
 
     for (const v of watched) {
       if (v.available && !notified.has(v.title)) {
-        await sendEmail(v.title, v.url);
+        await sendAvailabilityEmail(v.title, v.url);
         notified.add(v.title);
         log(`AVAILABLE: ${v.title}`);
       } else if (v.available) {
@@ -166,6 +208,23 @@ async function checkStock() {
         notified.delete(v.title); // re-arm if it goes unavailable again
         log(`${v.title} — not available`);
       }
+    }
+
+    // Price change for the selected variant (the one the URL points to).
+    const price = findSelectedPrice(response.data);
+    if (price == null) {
+      logError("Could not read selected-variant price this cycle");
+    } else if (lastPrice == null) {
+      lastPrice = price;
+      log(`Recorded starting price: ₹${price.toLocaleString("en-IN")}`);
+    } else if (Math.abs(price - lastPrice) > PRICE_THRESHOLD) {
+      const selectedTitle =
+        response.data?.RESPONSE?.pageData?.pageContext?.titles?.title ||
+        "iPhone 17";
+      await sendPriceEmail(selectedTitle, lastPrice, price);
+      lastPrice = price;
+    } else {
+      log(`Price unchanged: ₹${price.toLocaleString("en-IN")}`);
     }
   } catch (err) {
     logError(err.response?.status || "", err.message);
@@ -178,8 +237,9 @@ cron.schedule("*/5 * * * *", async () => {
 });
 
 log(
-  `Flipkart iPhone 17 monitor started. Watching: ` +
-    WATCHED.map((t) => t.join(" ")).join(" | ")
+  `Flipkart iPhone 17 monitor started. Availability: ` +
+    WATCHED.map((t) => t.join(" ")).join(" | ") +
+    ` | Price alerts on selected variant (>₹${PRICE_THRESHOLD} change)`
 );
 
 // Run once immediately.
